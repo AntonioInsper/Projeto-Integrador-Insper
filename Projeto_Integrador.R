@@ -19,6 +19,18 @@ library(ggthemes)
 library(vip)
 library(fastDummies)
 library(GGally)
+library(gbm)
+library(readr)
+library(xgboost)
+library(forcats)
+library(survival)
+library(survminer)
+
+
+
+
+bisnode_tratado <- read_csv("//wsl.localhost/Ubuntu/home/antonio/Insper/Computação Para A Ciência de Dados/bisnode_tratado")
+View(bisnode_tratado)
 
 bis <- bisnode_tratado
 
@@ -35,16 +47,20 @@ bis <- bisnode_tratado
 
 
 
-resultados <- tibble(modelo = c("Logística", "Ridge", "Lasso", "Floresta Aleatoria"), 
+resultados <- tibble(modelo = c("Logística", "Ridge", "Lasso", "Floresta Aleatoria","XGB"), 
                      ACURACIA = NA, AUC = NA)
-#bis <-subset(bis, select = -exit_year)  == retirar no Phyton
-#bis <-subset(bis, select = -exit_date)
-#bis <- subset(bis, select = -`Log10 Sales`)
-#bis <- subset(bis, select = -balsheet_flag)                  
-#bis <- subset(bis, select = -balsheet_length)
-#bis <- subset(bis, select = -birth_year) 
-#bis <- subset(bis, select = -ind)  
-#bis <- subset(bis, select = -ind2)  
+bis <-subset(bis, select = -exit_year) # == retirar no Phyton
+bis <-subset(bis, select = -exit_date)
+bis <- subset(bis, select = -`Log10 Sales`)
+bis <- subset(bis, select = -balsheet_flag)                  
+bis <- subset(bis, select = -balsheet_length)
+bis <- subset(bis, select = -birth_year) 
+bis <- subset(bis, select = -ind)  
+bis <- subset(bis, select = -ind2)
+bis <- subset(bis, select = -begin)
+bis <- subset(bis, select = -end)
+#bis <- subset(bis, select = -company_age)
+
 
 
 
@@ -70,6 +86,7 @@ teste$status <- as.factor(teste$status)
 
 # 2.1 GLM -----------------------------------------------------------------
 
+#Company_age e Founded_year parecem só apresentar problemas na regrassão logística. 
 
 fit <- glm(status ~ . -founded_year -company_age, data = treinamento, family = "binomial")
 
@@ -90,10 +107,12 @@ resultados$AUC[resultados$modelo == "Logística"] <-roc_curva$auc
 # 2.2 RIDGE -------------------------------------------------------------------
 idx <- sample(nrow(bis), size = .75 * nrow(bis), replace = FALSE)
 
-X_tr <- model.matrix(status ~ .-founded_year -company_age, bis)[idx, -1]
+#X_tr <- model.matrix(status ~ .-founded_year -company_age, bis)[idx, -1]
+X_tr <- model.matrix(status ~ ., bis)[idx, -1]
 y_tr <- bis$status[idx]
 
-X_test <- model.matrix(status ~ .-founded_year -company_age, bis)[-idx,-1]
+#X_test <- model.matrix(status ~ .-founded_year -company_age, bis)[-idx,-1]
+X_test <- model.matrix(status ~ ., bis)[-idx,-1]
 y_test <- bis$status[-idx]
 
 
@@ -203,7 +222,90 @@ resultados
 
 
 
-# Importância das Preditoras ----------------------------------------------
+
+
+# 2.5 XGB -----------------------------------------------------------------
+
+X <-model.matrix(status ~ ., -1, data = bis)
+
+#bis_x <- data.frame(X) %>% 
+#  mutate(status = bis$status)
+
+treinamento$status <- ifelse(treinamento$status == "Active", 1, 0)
+teste$status <- ifelse(teste$status == "Active", 1, 0)
+
+
+b_treino <- xgb.DMatrix(label = treinamento$status, 
+                        data = model.matrix(~ . + 0, data = treinamento %>% dplyr::select(-status)))
+
+b_teste <- xgb.DMatrix(label = teste$status, 
+                       data = model.matrix(~ . + 0, data = teste %>% dplyr::select(-status)))
+(fit_xgb <- xgb.train(data = b_treino, nrounds = 100, max_depth = 1, eta = 0.3,
+                      nthread = 3, verbose = FALSE, objective = "binary:logistic"))
+summary(fit_xgb)
+
+prob_xgb <- predict(fit_xgb, b_teste)
+acuracia_xgb <- mean(teste$status == ifelse(prob_xgb >= corte, 1, 0))
+resultados$ACURACIA[resultados$modelo == "XGB"] <- acuracia_xgb
+resultados
+
+
+roc_curva_XGB <- roc(teste$status, prob_xgb)
+resultados$AUC[resultados$modelo == "XGB"] <-roc_curva_XGB$auc
+resultados
+
+
+#Vamos tentar ajustar?
+
+
+ajusta_bst <- function(splits, eta, nrounds, max_depth) {
+  tr_ajs <- training(splits)
+  teste_ajs <- testing(splits)
+  b_treino <- xgb.DMatrix(label = treinamento$status, 
+                                    data = model.matrix(~ . + 0, data = treinamento %>% dplyr::select(-status)))
+  b_teste <- xgb.DMatrix(label = teste$status, 
+                         data = model.matrix(~ . + 0, data = teste %>% dplyr::select(-status)))
+  fit <- xgb.train(data = b_treino, nrounds = nrounds, max_depth = max_depth, eta = eta,
+                   nthread = 3, verbose = FALSE, objective = "binary:logistic")
+  acc <- mean(teste$status == ifelse(predict(fit_xgb, b_teste) >= corte, 1, 0))
+  return(acc)
+ }
+
+
+hiperparametros <- crossing(eta = c(.01, .1),
+                            nrounds = c(250, 750),
+                            max_depth = c(1, 4))
+
+resultados_ajs <- rsample::vfold_cv(treinamento, 5) %>%
+  crossing(hiperparametros) %>%
+  mutate(acc = pmap_dbl(list(splits, eta, nrounds, max_depth), ajusta_bst))
+
+resultados_ajs %>%
+  group_by(eta, nrounds, max_depth) %>%
+  summarise(acc = mean(acc)) %>%
+  arrange(acc)
+
+fit_xgb <- xgb.train(data = b_treino, nrounds = 250, max_depth = 1, eta = 0.1,
+                     nthread = 3, verbose = FALSE, objective = "binary:logistic")
+
+prob_xgb <- predict(fit_xgb, b_teste)
+acuracia_xgb <- mean(teste$status == ifelse(prob_xgb >= corte, 1, 0))
+resultados$ACURACIA[resultados$modelo == "XGB"] <- acuracia_xgb
+
+
+roc_curva_XGB <- roc(teste$status, prob_xgb)
+resultados$AUC[resultados$modelo == "XGB"] <-roc_curva_XGB$auc
+resultados
+
+#Com essa seed (7777) náo mudou nada -.-
+
+
+
+# 3 Comparações -------------------------------------------------------------
+
+print(resultados)
+
+# 4 Importância das Preditoras ----------------------------------------------
 
 rf <- ranger(status ~ ., num.trees = 106, importance='impurity', data = treinamento, probability = T)
 vip::vip(rf, aesthetics = list(fill = "blue"))
@@ -218,7 +320,8 @@ vip::vip(lasso, aesthetics = list(fill = "orange"))
 
 vip::vip(ridge, aesthetics = list(fill = "purple"))
 
-
+importancia <- xgb.importance(model = fit_xgb)
+xgb.plot.importance(importancia, rel_to_first = TRUE, top_n = 10, xlab = "Relative Import")
 
 
 
